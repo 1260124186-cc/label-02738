@@ -17,7 +17,7 @@ docker-compose down
 
 | 服务 | 端口 | 描述 |
 |------|------|------|
-| backend | 8081 | 贝尔曼方程求解 API |
+| backend | 8084 | 贝尔曼方程求解 API |
 
 API 端点:
 - `GET /api/health` - 健康检查
@@ -29,12 +29,14 @@ API 端点:
 本项目为计算服务，无需登录账号。
 
 ## 题目内容
-
 我需要你编写程序来计算一个贝尔曼方程，用python 写并测试
 
 $$
 \begin{aligned}
-V_{t}(x_{t}, p_{t}) & = \max _{y_{t} \in [0, \eta]} \left\{ R\left( \frac{y_{t}}{\eta}-x_{t}, P_{t} \right) + \delta \mathbb{E}_{t}(V_{t}(y_{t}, p_{t+1})) \right\} \\
+V_{t}(x_{t}, p_{t}) & = \max _{y_{t} \in [0, \eta]} \left\{ R\left( \frac{y_{t}}{\eta}-x_{t}, P_{t} \right) + \delta \mathbb{E}_{t}(V_{t}(y_{t}, p_{t+1})) \right\}
+
+\\
+
 V_{T+1}(x_{T+1}, p_{T+1}) & = 0
 \end{aligned}
 $$
@@ -45,9 +47,10 @@ $$
 R\left( \frac{y_{t}}{\eta}-x_{t}, p_{t} \right) = p_{t}\beta\left( x_{t} - \frac{y_{t}}{\eta} \right)^{+} + \left( -(p_{t} /\alpha) \left( \frac{y_{t}}{\eta}-x_{t} \right)^{+} \right)
 $$
 
-和 $\mathbb{E}_{t}$ 是 $\mathbb{E} [\cdot | p_{t}]$ 的简写，也就是说，对第二项（价格）求平均。
+and $\mathbb{E}_{t}$ is shorthand of $\mathbb{E} [\cdot | p_{t}]$，也就是说，对第二项（价格）求平均。
 
-$R$ 代表这个时刻的 immediate payoff. $x_{t}$ 是没做决定时的库存，$y_{t}$ 是这个时刻最后的库存（在做了决定和每次 eta 的固定损失后）, $p_{t}$ 是价格，在 R 中的第一项中，库存减少意味着卖出，第二项意味着买入，$\alpha, \beta$ 都是小于等于1的常数。$\delta \mathbb{E}_{t}(V_{t}(y_{t}, p_{t+1}))$ 代表下一时刻的期望, $\delta$ 是折扣因子。
+$R$ 代表这个时刻的 immediate payoff. $x_{t}$ 是没做决定时的库存，$y_{t}$ 是这个时刻最后的库存（在做了决定和 每次eta 的固定损失后）, $p_{t}$ 是价格，在R中的第一项中，库存减少意味着卖出，第二项意味着买入，$\alpha, \beta$ 都是小于等于1的常数。$\delta \mathbb{E}_{t}(V_{t}(y_{t}, p_{t+1}))$ 代表下一时刻的期望, $\delta$ 是折扣因子
+
 
 然后在计算出
 
@@ -58,10 +61,18 @@ w_{t}^{B}(y_{t}, p_{t})  & =  \left( -P_{t} \cdot y_{t} \cdot  \frac{1}{ \alpha 
 \end{aligned}
 $$
 
-第一个情况对应着卖出，去掉常数项和max，第二个是只买入。
+第一个情况对应着卖出，去掉常数项和max，第二个是只买入.
+所以在计算 immediate payoff，你可能需要分两种情况，这样后面计算这两个函数会方便一点。
 
-假设 $\alpha = \beta = 0.9$, $x_{1}= 1$, $T = 12$, $\eta = 0.95$. $p_{t}$ 是正态分布, 平均为5方差为2，$\delta = 0.9$.
 
+假设
+$\alpha = \beta = 0.9$, $x_{1}= 1$, $T = 12$, $\eta = 0.95$. $p_{t}$ 是正态分布, 平均为5方差为2，$\delta = 0.9$.
+
+你需要先生成一组p_t 来知道你在 $t$ 时刻观察到的数据，然后计算 $R$ 和 $\delta \mathbb{E}_{t}(V_{t}(y_{t}, p_{t+1}))$. 因为下一时刻的价格未知，我们又知道真实分布，所以求平均 make sense。
+
+这样你就知道max里的真实函数了，已经证明最大值在三个地方，一个是0, 一个是eta, 一个是eta x_t，你只需比较
+
+你可能需要向量化来加速运算,注意可读性，
 ---
 
 ## 项目介绍
@@ -87,12 +98,12 @@ $$
 
 ```bash
 # 求解贝尔曼方程
-curl -X POST http://localhost:8081/api/solve \
+curl -X POST http://localhost:8084/api/solve \
   -H "Content-Type: application/json" \
   -d '{"alpha": 0.9, "beta": 0.9, "T": 12}'
 
 # 计算即时收益
-curl -X POST http://localhost:8081/api/immediate_reward \
+curl -X POST http://localhost:8084/api/immediate_reward \
   -H "Content-Type: application/json" \
   -d '{"x_t": 1.0, "y_t": 0.5, "p_t": 5.0}'
 ```
@@ -103,7 +114,7 @@ curl -X POST http://localhost:8081/api/immediate_reward \
 ### 1. 健康检查
 
 ```bash
-curl http://localhost:8081/api/health
+curl http://localhost:8084/api/health
 ```
 
 预期输出：
@@ -114,7 +125,7 @@ curl http://localhost:8081/api/health
 ### 2. 求解贝尔曼方程
 
 ```bash
-curl -X POST http://localhost:8081/api/solve \
+curl -X POST http://localhost:8084/api/solve \
   -H "Content-Type: application/json" \
   -d '{"T": 5, "seed": 42}'
 ```
@@ -138,7 +149,7 @@ curl -X POST http://localhost:8081/api/solve \
 ### 3. 计算即时收益
 
 ```bash
-curl -X POST http://localhost:8081/api/immediate_reward \
+curl -X POST http://localhost:8084/api/immediate_reward \
   -H "Content-Type: application/json" \
   -d '{"x_t": 1.0, "y_t": 0.5, "p_t": 5.0}'
 ```

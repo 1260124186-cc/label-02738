@@ -30,9 +30,14 @@ class Parameters:
     delta: float = 0.9      # 时间折扣因子
     T: int = 12             # 时间期数
     x_1: float = 1.0        # 初始库存
-    p_mean: float = 5.0     # 价格均值
-    p_std: float = 2.0      # 价格标准差
+    p_mean: float = 5.0     # 价格长期均值
+    p_std: float = 2.0      # 价格创新标准差
+    p_rho: float = 0.8      # 价格自回归系数
     n_price_samples: int = 100  # 价格采样数量（用于期望计算）
+    n_x_grid: int = 50      # 库存状态离散点数
+    n_p_grid: int = 50      # 价格状态离散点数
+    p_min: float = 0.01     # 价格网格最小值
+    p_max: float = 20.0     # 价格网格最大值
 
 
 class BellmanSolver:
@@ -41,14 +46,42 @@ class BellmanSolver:
     def __init__(self, params: Parameters):
         self.params = params
         self._interpolation_count = 0  # 追踪插值次数
-        # 预生成价格样本用于计算期望
-        self.price_samples = np.random.normal(
-            params.p_mean, params.p_std, params.n_price_samples
-        )
-        # 确保价格为正
-        self.price_samples = np.maximum(self.price_samples, 0.01)
+        self._init_grids()  # 初始化状态空间网格
         logger.info(f"BellmanSolver initialized with params: alpha={params.alpha}, "
-                   f"beta={params.beta}, eta={params.eta}, T={params.T}")
+                   f"beta={params.beta}, eta={params.eta}, T={params.T}, "
+                   f"price_rho={params.p_rho}, price_mean={params.p_mean}, price_std={params.p_std}, "
+                   f"x_grid={params.n_x_grid} points, p_grid={params.n_p_grid} points")
+
+    def _init_grids(self):
+        """初始化状态空间网格"""
+        # 库存状态网格：[0, eta]
+        self.x_grid = np.linspace(0, self.params.eta, self.params.n_x_grid)
+        # 价格状态网格：[p_min, p_max]
+        self.p_grid = np.linspace(self.params.p_min, self.params.p_max, self.params.n_p_grid)
+        logger.info(f"Initialized state grids: x_grid={self.x_grid.shape}, p_grid={self.p_grid.shape}")
+
+    def _find_closest_state(self, x: float, p: float, V_dict: Dict) -> Tuple[float, float]:
+        """在网格中找到最接近的状态点"""
+        # 使用快速查找找到最接近的网格点
+        x_idx = np.searchsorted(self.x_grid, x, side='right') - 1
+        x_idx = np.clip(x_idx, 0, len(self.x_grid) - 1)
+
+        p_idx = np.searchsorted(self.p_grid, p, side='right') - 1
+        p_idx = np.clip(p_idx, 0, len(self.p_grid) - 1)
+
+        x_closest = self.x_grid[x_idx]
+        p_closest = self.p_grid[p_idx]
+
+        return (round(x_closest, 4), round(p_closest, 4))
+
+    def _init_value_function(self) -> Dict:
+        """初始化价值函数，在整个(x,p)网格上设为0"""
+        V = {}
+        for x in self.x_grid:
+            for p in self.p_grid:
+                key = (round(x, 4), round(p, 4))
+                V[key] = 0.0
+        return V
 
     def immediate_reward_sell(self, x_t: np.ndarray, y_t: np.ndarray, p_t: float) -> np.ndarray:
         """
@@ -72,14 +105,22 @@ class BellmanSolver:
         """
         return self.immediate_reward_sell(x_t, y_t, p_t) + self.immediate_reward_buy(x_t, y_t, p_t)
 
-    def compute_expected_value(self, V_next: Dict[float, float], y_t: float) -> float:
+    def compute_expected_value(self, V_next: Dict[float, float], y_t: float, p_t: float) -> float:
         """
-        计算 E_t[V_{t+1}(y_t, p_{t+1})]
-        对下一期价格求期望
+        计算条件期望 E_t[V_{t+1}(y_t, p_{t+1}) | p_t]
+        基于当期价格p_t对下一期价格求期望
         """
         expected_values = []
         missing_count = 0
-        for p_next in self.price_samples:
+
+        # 基于当期价格p_t生成下一期价格p_{t+1}的样本
+        # 使用AR(1)过程: p_{t+1} = p_mean + rho*(p_t - p_mean) + epsilon
+        # 其中epsilon ~ N(0, p_std^2)
+        p_next_mean = self.params.p_mean + self.params.p_rho * (p_t - self.params.p_mean)
+        p_next_samples = np.random.normal(p_next_mean, self.params.p_std, self.params.n_price_samples)
+        p_next_samples = np.maximum(p_next_samples, 0.01)
+
+        for p_next in p_next_samples:
             key = (y_t, round(p_next, 4))
             if key in V_next:
                 expected_values.append(V_next[key])
@@ -90,8 +131,8 @@ class BellmanSolver:
                 expected_values.append(closest_value)
 
         if missing_count > 0:
-            logger.debug(f"compute_expected_value: {missing_count}/{len(self.price_samples)} "
-                        f"samples required interpolation for y_t={y_t:.4f}")
+            logger.debug(f"compute_expected_value: {missing_count}/{len(p_next_samples)} "
+                        f"samples required interpolation for y_t={y_t:.4f}, p_t={p_t:.4f}")
 
         return np.mean(expected_values)
 
@@ -141,8 +182,16 @@ class BellmanSolver:
         T = self.params.T
         eta = self.params.eta
 
-        # 存储结果
-        V = {t: {} for t in range(1, T + 2)}
+        # 存储结果 - 在完整(x,p)网格上初始化
+        V = {}
+        for t in range(1, T + 2):
+            if t == T + 1:
+                # 终端状态值为0
+                V[t] = self._init_value_function()
+            else:
+                # 初始化所有时期的价值函数为完整的(x,p)网格
+                V[t] = self._init_value_function()
+
         optimal_y = {t: {} for t in range(1, T + 1)}
         # w^S 和 w^B 是关于 (y_t, p_t) 的函数
         w_S = {t: {} for t in range(1, T + 1)}
@@ -150,86 +199,114 @@ class BellmanSolver:
 
         # 后向递归
         for t in range(T, 0, -1):
-            p_t = observed_prices[t - 1]
-            logger.debug(f"Processing period t={t}, p_t={p_t:.4f}")
-
-            if t == 1:
-                x_values = [self.params.x_1]
-            else:
-                x_values = np.linspace(0, eta, 50)
+            logger.debug(f"Processing period t={t}")
 
             # y_t 的可能取值范围 [0, eta]
-            y_values = np.linspace(0, eta, 50)
+            y_values = self.x_grid
 
-            # 先计算所有 y_t 值对应的 w^S 和 w^B
-            for y_t in y_values:
-                if t == T:
-                    EV_next = 0
-                else:
-                    EV_next = self._compute_expected_value_vectorized(
-                        V[t + 1], y_t, observed_prices
-                    )
+            # 遍历整个价格网格
+            for p_t in self.p_grid:
+                logger.debug(f"  Processing price level p_t={p_t:.4f}")
 
-                y_key = (round(y_t, 4), round(p_t, 4))
-                w_S[t][y_key] = self.compute_w_S(y_t, p_t, EV_next)
-                w_B[t][y_key] = self.compute_w_B(y_t, p_t, EV_next)
-
-            for x_t in x_values:
-                candidates = np.array([0, eta * x_t, eta])
-                candidates = np.clip(candidates, 0, eta)
-
-                best_value = -np.inf
-                best_y = 0
-
-                for y_t in candidates:
-                    R_t = self.immediate_reward(
-                        np.array([x_t]), np.array([y_t]), p_t
-                    )[0]
-
+                # 先计算所有 y_t 值对应的 w^S 和 w^B
+                for y_t in y_values:
                     if t == T:
                         EV_next = 0
                     else:
                         EV_next = self._compute_expected_value_vectorized(
-                            V[t + 1], y_t, observed_prices
+                            V[t + 1], y_t, p_t
                         )
 
-                    total_value = R_t + self.params.delta * EV_next
+                    y_key = (round(y_t, 4), round(p_t, 4))
+                    w_S[t][y_key] = self.compute_w_S(y_t, p_t, EV_next)
+                    w_B[t][y_key] = self.compute_w_B(y_t, p_t, EV_next)
 
-                    if total_value > best_value:
-                        best_value = total_value
-                        best_y = y_t
+                # 遍历整个库存网格
+                for x_t in self.x_grid:
+                    candidates = np.array([0, eta * x_t, eta])
+                    candidates = np.clip(candidates, 0, eta)
 
-                key = (round(x_t, 4), round(p_t, 4))
-                V[t][key] = best_value
-                optimal_y[t][key] = best_y
+                    best_value = -np.inf
+                    best_y = 0
+
+                    for y_t in candidates:
+                        R_t = self.immediate_reward(
+                            np.array([x_t]), np.array([y_t]), p_t
+                        )[0]
+
+                        if t == T:
+                            EV_next = 0
+                        else:
+                            EV_next = self._compute_expected_value_vectorized(
+                                V[t + 1], y_t, p_t
+                            )
+
+                        total_value = R_t + self.params.delta * EV_next
+
+                        if total_value > best_value:
+                            best_value = total_value
+                            best_y = y_t
+
+                    key = (round(x_t, 4), round(p_t, 4))
+                    V[t][key] = best_value
+                    optimal_y[t][key] = best_y
 
         logger.info(f"Bellman solve completed. Total interpolations: {self._interpolation_count}")
         return V, optimal_y, {'w_S': w_S, 'w_B': w_B}
 
     def _compute_expected_value_vectorized(
-        self, V_next: Dict, y_t: float, observed_prices: np.ndarray
+        self, V_next: Dict, y_t: float, p_t: float
     ) -> float:
-        """向量化计算期望值"""
+        """向量化计算期望值 E_t[V_{t+1}(y_t, p_{t+1}) | p_t]"""
         x_next = y_t
         values = []
 
-        for p_sample in self.price_samples:
-            key = (round(x_next, 4), round(p_sample, 4))
+        # 基于当期价格p_t生成下一期价格p_{t+1}的样本
+        # 使用AR(1)过程: p_{t+1} = p_mean + rho*(p_t - p_mean) + epsilon
+        # 其中epsilon ~ N(0, p_std^2)
+        p_next_mean = self.params.p_mean + self.params.p_rho * (p_t - self.params.p_mean)
+        p_next_samples = np.random.normal(p_next_mean, self.params.p_std, self.params.n_price_samples)
+        p_next_samples = np.maximum(p_next_samples, 0.01)
+
+        # 使用网格加速查找：将样本映射到最近的网格点
+        p_next_indices = np.searchsorted(self.p_grid, p_next_samples, side='right') - 1
+        p_next_indices = np.clip(p_next_indices, 0, len(self.p_grid) - 1)
+        p_next_grid_values = self.p_grid[p_next_indices]
+
+        # 找到库存y_t对应的网格索引
+        x_idx = np.searchsorted(self.x_grid, x_next, side='right') - 1
+        x_idx = np.clip(x_idx, 0, len(self.x_grid) - 1)
+        x_grid_value = self.x_grid[x_idx]
+
+        # 批量获取价值函数值
+        for p_grid in p_next_grid_values:
+            key = (round(x_grid_value, 4), round(p_grid, 4))
             if key in V_next:
                 values.append(V_next[key])
             else:
-                closest_value = self._find_closest_value(V_next, x_next, p_sample)
-                values.append(closest_value)
-                self._interpolation_count += 1
+                # 即使网格查找失败，也尝试快速查找
+                grid_key = self._find_closest_state(x_next, p_grid, V_next)
+                if grid_key in V_next:
+                    values.append(V_next[grid_key])
+                else:
+                    closest_value = self._find_closest_value(V_next, x_next, p_grid)
+                    values.append(closest_value)
+                    self._interpolation_count += 1
 
         return np.mean(values) if values else 0
 
     def _find_closest_value(self, V_dict: Dict, x: float, p: float) -> float:
-        """找到最接近的状态值"""
+        """找到最接近的状态值（使用网格加速查找）"""
         if not V_dict:
             logger.warning(f"Empty V_dict when finding closest value for x={x:.4f}, p={p:.4f}")
             return 0
 
+        # 先尝试快速网格查找
+        grid_key = self._find_closest_state(x, p, V_dict)
+        if grid_key in V_dict:
+            return V_dict[grid_key]
+
+        # 如果网格查找失败，回退到原始方法
         min_dist = np.inf
         closest_val = 0
 

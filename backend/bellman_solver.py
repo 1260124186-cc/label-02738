@@ -32,7 +32,8 @@ class Parameters:
     x_1: float = 1.0        # 初始库存
     p_mean: float = 5.0     # 价格均值
     p_std: float = 2.0      # 价格标准差
-    n_price_samples: int = 100  # 价格采样数量（用于期望计算）
+    n_price_samples: int = 50  # 价格采样数量（用于期望计算）
+    n_price_grid: int = 10  # 价格网格点数（用于存储价值函数）
 
 
 class BellmanSolver:
@@ -148,66 +149,86 @@ class BellmanSolver:
         w_S = {t: {} for t in range(1, T + 1)}
         w_B = {t: {} for t in range(1, T + 1)}
 
+        # 生成价格网格 - 在合理范围内覆盖可能的价格值
+        # 使用 [max(0.01, p_mean - 3*p_std), p_mean + 3*p_std] 覆盖99.7%的价格
+        p_min = max(0.01, self.params.p_mean - 3 * self.params.p_std)
+        p_max = self.params.p_mean + 3 * self.params.p_std
+        price_grid = np.linspace(p_min, p_max, self.params.n_price_grid)
+
+        logger.info(f"Using price grid with {self.params.n_price_grid} points "
+                   f"from {p_min:.2f} to {p_max:.2f}")
+
         # 后向递归
         for t in range(T, 0, -1):
-            p_t = observed_prices[t - 1]
-            logger.debug(f"Processing period t={t}, p_t={p_t:.4f}")
+            logger.debug(f"Processing period t={t}")
 
             if t == 1:
-                x_values = [self.params.x_1]
+                # t=1 时只需要在初始库存和观察到的价格上计算
+                p_values_to_process = [observed_prices[0]]
             else:
-                x_values = np.linspace(0, eta, 50)
+                p_values_to_process = price_grid
 
-            # y_t 的可能取值范围 [0, eta]
-            y_values = np.linspace(0, eta, 50)
-
-            # 先计算所有 y_t 值对应的 w^S 和 w^B
-            for y_t in y_values:
-                if t == T:
-                    EV_next = 0
+            # 对于每个时间步，在价格网格上计算价值函数
+            for p_t in p_values_to_process:
+                if t == 1:
+                    # t=1 时只需要在初始库存和观察到的价格上计算
+                    x_values = [self.params.x_1]
+                    p_values = [observed_prices[0]]
                 else:
-                    EV_next = self._compute_expected_value_vectorized(
-                        V[t + 1], y_t, observed_prices
-                    )
+                    x_values = np.linspace(0, eta, 20)
+                    p_values = [p_t]
 
-                y_key = (round(y_t, 4), round(p_t, 4))
-                w_S[t][y_key] = self.compute_w_S(y_t, p_t, EV_next)
-                w_B[t][y_key] = self.compute_w_B(y_t, p_t, EV_next)
+                # y_t 的可能取值范围 [0, eta]
+                y_values = np.linspace(0, eta, 20)
 
-            for x_t in x_values:
-                candidates = np.array([0, eta * x_t, eta])
-                candidates = np.clip(candidates, 0, eta)
-
-                best_value = -np.inf
-                best_y = 0
-
-                for y_t in candidates:
-                    R_t = self.immediate_reward(
-                        np.array([x_t]), np.array([y_t]), p_t
-                    )[0]
-
+                # 先计算所有 y_t 值对应的 w^S 和 w^B
+                for y_t in y_values:
                     if t == T:
                         EV_next = 0
                     else:
                         EV_next = self._compute_expected_value_vectorized(
-                            V[t + 1], y_t, observed_prices
+                            V[t + 1], y_t
                         )
 
-                    total_value = R_t + self.params.delta * EV_next
+                    y_key = (round(y_t, 4), round(p_t, 4))
+                    w_S[t][y_key] = self.compute_w_S(y_t, p_t, EV_next)
+                    w_B[t][y_key] = self.compute_w_B(y_t, p_t, EV_next)
 
-                    if total_value > best_value:
-                        best_value = total_value
-                        best_y = y_t
+                for x_t in x_values:
+                    for current_p in p_values:
+                        candidates = np.array([0, eta * x_t, eta])
+                        candidates = np.clip(candidates, 0, eta)
 
-                key = (round(x_t, 4), round(p_t, 4))
-                V[t][key] = best_value
-                optimal_y[t][key] = best_y
+                        best_value = -np.inf
+                        best_y = 0
+
+                        for y_t in candidates:
+                            R_t = self.immediate_reward(
+                                np.array([x_t]), np.array([y_t]), current_p
+                            )[0]
+
+                            if t == T:
+                                EV_next = 0
+                            else:
+                                EV_next = self._compute_expected_value_vectorized(
+                                    V[t + 1], y_t
+                                )
+
+                            total_value = R_t + self.params.delta * EV_next
+
+                            if total_value > best_value:
+                                best_value = total_value
+                                best_y = y_t
+
+                        key = (round(x_t, 4), round(current_p, 4))
+                        V[t][key] = best_value
+                        optimal_y[t][key] = best_y
 
         logger.info(f"Bellman solve completed. Total interpolations: {self._interpolation_count}")
         return V, optimal_y, {'w_S': w_S, 'w_B': w_B}
 
     def _compute_expected_value_vectorized(
-        self, V_next: Dict, y_t: float, observed_prices: np.ndarray
+        self, V_next: Dict, y_t: float
     ) -> float:
         """向量化计算期望值"""
         x_next = y_t
